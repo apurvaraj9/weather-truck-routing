@@ -1,0 +1,19 @@
+# secrets
+.env
+*.env.local
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# node / build output
+node_modules/
+frontend/dist/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

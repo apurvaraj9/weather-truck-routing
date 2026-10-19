@@ -1,0 +1,15 @@
+# Render Blueprint: one free Docker web service (frontend + API in one container).
+services:
+  - type: web
+    name: weather-truck-routing
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health/
+    envVars:
+      - key: TOMTOM_API_KEY
+        sync: false          # entered by you in the Render dashboard, never committed
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DJANGO_DEBUG
+        value: "false"
