@@ -1,8 +1,6 @@
-"""Open-Meteo parsing, unit conversion, hour selection at ETA, batching and errors."""
+"""Open-Meteo request description, parsing, unit conversion and hour selection at ETA."""
 from datetime import datetime, timezone
-from unittest import mock
 
-from django.core.cache import cache
 from django.test import SimpleTestCase
 
 from planner.providers import ProviderError, openmeteo
@@ -20,33 +18,24 @@ def om_item(hours=4, wind=None, rain=None, showers=None, snow=None):
     }}
 
 
-class FakeResponse:
-    def __init__(self, status, payload):
-        self.status_code = status
-        self._payload = payload
-
-    def json(self):
-        return self._payload
-
-
 class Parsing(SimpleTestCase):
     def test_units_are_converted_to_inches(self):
-        s = openmeteo._parse_location(om_item(wind=[30, 30, 30, 30], rain=[0, 2.0, 0, 0],
-                                              showers=[0, 0.54, 0, 0], snow=[0, 0, 2.54, 0]))
+        s = openmeteo.parse_hourly(om_item(wind=[30, 30, 30, 30], rain=[0, 2.0, 0, 0],
+                                           showers=[0, 0.54, 0, 0], snow=[0, 0, 2.54, 0])["hourly"])
         self.assertAlmostEqual(s.rain_in[1], 0.1)   # (2.0 + 0.54) mm = 0.1 in
         self.assertAlmostEqual(s.snow_in[2], 1.0)   # 2.54 cm = 1.0 in
         self.assertEqual(s.wind_mph[0], 30)
 
     def test_rain_boundary_survives_unit_conversion(self):
         # 2.54 mm/h must classify as exactly 0.10 in/h (Moderate), not 0.0999...
-        s = openmeteo._parse_location(om_item(rain=[0, 2.54, 0, 0]))
+        s = openmeteo.parse_hourly(om_item(rain=[0, 2.54, 0, 0])["hourly"])
         self.assertEqual(s.at(T0 + 30 * 60)["rain_in_hr"], 0.1)
 
 
 class ValueAtEta(SimpleTestCase):
     def setUp(self):
-        self.s = openmeteo._parse_location(om_item(
-            wind=[10, 20, 30, 40], rain=[0, 2.54, 5.08, 0], snow=[0, 0, 0, 2.54]))
+        self.s = openmeteo.parse_hourly(om_item(
+            wind=[10, 20, 30, 40], rain=[0, 2.54, 5.08, 0], snow=[0, 0, 0, 2.54])["hourly"])
 
     def test_wind_uses_nearest_hour(self):
         self.assertEqual(self.s.at(T0 + 20 * 60)["wind_mph"], 10)
@@ -59,58 +48,36 @@ class ValueAtEta(SimpleTestCase):
         self.assertEqual(self.s.at(T0 + 2 * 3600 + 1)["snow_in_hr"], 1.0)
 
     def test_missing_values_are_flagged(self):
-        s = openmeteo._parse_location(om_item(wind=[None, None, None, None]))
+        s = openmeteo.parse_hourly(om_item(wind=[None, None, None, None])["hourly"])
         self.assertTrue(s.at(T0)["missing"])
         self.assertFalse(self.s.at(T0)["missing"])
 
 
-class Fetching(SimpleTestCase):
+class BrowserQuery(SimpleTestCase):
+    """The server describes the Open-Meteo request; the browser sends it."""
+
     def setUp(self):
-        cache.clear()
         self.start = datetime(2026, 10, 20, 0, 30, tzinfo=timezone.utc)
         self.end = datetime(2026, 10, 20, 2, 10, tzinfo=timezone.utc)
 
-    def test_deduplicates_nearby_points_and_requests_correct_window(self):
-        calls = []
-
-        def fake_get(url, params, timeout):
-            calls.append(params)
-            n = len(params["latitude"].split(","))
-            return FakeResponse(200, [om_item() for _ in range(n)] if n > 1 else om_item())
-
+    def test_deduplicates_nearby_points_and_covers_the_window(self):
         pts = [(35.001, -100.001), (35.002, -100.002), (36.0, -101.0)]
-        with mock.patch("planner.providers.openmeteo.requests.get", side_effect=fake_get):
-            out = openmeteo.fetch_hourly(pts, self.start, self.end)
-        self.assertEqual(len(out), 3)
-        self.assertIs(out[0], out[1])                    # same 0.05-degree cell -> one lookup
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(len(calls[0]["latitude"].split(",")), 2)
-        self.assertEqual(calls[0]["start_hour"], "2026-10-20T00:00")
-        self.assertEqual(calls[0]["end_hour"], "2026-10-20T03:00")
-        self.assertEqual(calls[0]["wind_speed_unit"], "mph")
+        q, index = openmeteo.build_query(pts, self.start, self.end)
+        self.assertEqual(len(q["points"]), 2)                # same 0.05-degree cell -> one lookup
+        self.assertEqual(index, [0, 0, 1])
+        self.assertEqual(q["params"]["start_hour"], "2026-10-20T00:00")
+        self.assertEqual(q["params"]["end_hour"], "2026-10-20T03:00")
+        self.assertEqual(q["params"]["wind_speed_unit"], "mph")
+        self.assertEqual(q["params"]["timezone"], "GMT")
+        self.assertEqual(q["params"]["hourly"], "wind_speed_10m,rain,showers,snowfall")
+        self.assertEqual(q["batch_size"], 100)
 
-        # Second identical request is served from cache.
-        with mock.patch("planner.providers.openmeteo.requests.get", side_effect=AssertionError):
-            openmeteo.fetch_hourly(pts, self.start, self.end)
-
-    def test_batches_large_requests(self):
-        calls = []
-
-        def fake_get(url, params, timeout):
-            n = len(params["latitude"].split(","))
-            calls.append(n)
-            return FakeResponse(200, [om_item() for _ in range(n)])
-
-        pts = [(30 + i * 0.1, -100.0) for i in range(250)]
-        with mock.patch("planner.providers.openmeteo.requests.get", side_effect=fake_get):
-            out = openmeteo.fetch_hourly(pts, self.start, self.end)
-        self.assertEqual(len(out), 250)
-        self.assertEqual(sorted(calls), [50, 100, 100])
-
-    def test_rate_limit_is_reported_clearly(self):
-        with mock.patch("planner.providers.openmeteo.requests.get",
-                        return_value=FakeResponse(429, {"reason": "limit"})):
-            with self.assertRaises(ProviderError) as ctx:
-                openmeteo.fetch_hourly([(35, -100)], self.start, self.end)
-        self.assertEqual(ctx.exception.status, 503)
-        self.assertIn("rate limit", str(ctx.exception))
+    def test_rejects_malformed_posted_weather(self):
+        good = om_item()["hourly"]
+        for bad in [None, {}, {"time": []}, dict(good, rain=[0.0]), dict(good, wind_speed_10m=["x"] * 4),
+                    dict(good, snowfall=[float("inf")] * 4)]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ProviderError):
+                    openmeteo.parse_hourly(bad)
+        with self.assertRaises(ProviderError):
+            openmeteo.parse_many([good], 2)

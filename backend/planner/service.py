@@ -1,4 +1,11 @@
-"""Builds a complete trip plan: 3 route options, checkpoints, weather at ETA, risk, recommendation."""
+"""Trip planning in two steps.
+
+1. plan_routes: geocode, 3 truck routes (TomTom), checkpoints every N miles with the
+   truck's ETA at each, the corridor heatmap grid, and the Open-Meteo request that the
+   browser must make for those checkpoints (see providers/openmeteo.py for why).
+2. score_routes: from the browser-fetched forecasts, the weather at each checkpoint's
+   ETA, the risk level (risk table + load rules), route summaries and the recommendation.
+"""
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -65,8 +72,8 @@ def get_three_routes(origin, destination, depart):
     return chosen[:ROUTE_COUNT], notices
 
 
-def build_plan(origin_q: str, destination_q: str, departure: datetime, load_lb: float,
-               interval_miles: int) -> dict:
+def plan_routes(origin_q: str, destination_q: str, departure: datetime, load_lb: float,
+                interval_miles: int) -> dict:
     with ThreadPoolExecutor(max_workers=2) as pool:
         origin, destination = pool.map(tomtom.geocode, [origin_q, destination_q])
     o, d = (origin.lat, origin.lon), (destination.lat, destination.lon)
@@ -80,34 +87,75 @@ def build_plan(origin_q: str, destination_q: str, departure: datetime, load_lb: 
     raw_routes, notices = get_three_routes(o, d, depart_param)
 
     # Checkpoints every N route miles, with the truck's ETA at each.
-    routes = []
+    routes, all_points = [], []
     for i, raw in enumerate(raw_routes):
         profile = RouteProfile(raw.points, raw.length_miles, raw.travel_seconds, raw.anchors)
-        routes.append({"raw": raw, "checkpoints": sample_checkpoints(profile, interval_miles),
-                       "id": f"Route {chr(65 + i)}"})
-
-    # One weather lookup for every checkpoint of every route.
-    all_cps = [cp for r in routes for cp in r["checkpoints"]]
-    longest = max(r["raw"].travel_seconds for r in routes)
-    series = openmeteo.fetch_hourly([(cp.lat, cp.lon) for cp in all_cps],
-                                    effective_departure, effective_departure + timedelta(seconds=longest))
-    series_iter = iter(series)
-
-    summaries, missing_weather = [], False
-    for r in routes:
-        cps_out, levels = [], []
-        for cp in r["checkpoints"]:
+        cps = []
+        for cp in sample_checkpoints(profile, interval_miles):
             eta = effective_departure + timedelta(seconds=cp.seconds)
-            wx = next(series_iter).at(eta.timestamp())
-            missing_weather |= wx["missing"]
-            risk = assess(wx["wind_mph"], wx["rain_in_hr"], wx["snow_in_hr"], load_lb)
-            levels.append((risk.level, cp.covered_miles))
-            cps_out.append({
+            cps.append({
                 "index": cp.index,
                 "mile": round(cp.mile, 1),
                 "lat": round(cp.lat, 5),
                 "lon": round(cp.lon, 5),
                 "eta": eta.isoformat(timespec="minutes"),
+                "covered_miles": round(cp.covered_miles, 2),
+            })
+            all_points.append((cp.lat, cp.lon))
+        routes.append({
+            "id": f"Route {chr(65 + i)}",
+            "source": raw.source,
+            "distance_miles": round(raw.length_miles, 1),
+            "duration_seconds": round(raw.travel_seconds),
+            "geometry": [[round(la, 5), round(lo, 5)] for la, lo in simplify(raw.points)],
+            "checkpoints": cps,
+        })
+
+    # The single forecast request (made by the browser) covering every checkpoint's ETA.
+    longest = max(r.travel_seconds for r in raw_routes)
+    query, index = openmeteo.build_query(all_points, effective_departure,
+                                         effective_departure + timedelta(seconds=longest))
+    it = iter(index)
+    for r in routes:
+        for cp in r["checkpoints"]:
+            cp["point"] = next(it)
+
+    grid = heatmap.build_grid([r.points for r in raw_routes])
+    return {
+        "origin": vars(origin),
+        "destination": vars(destination),
+        "departure": effective_departure.isoformat(timespec="minutes"),
+        "load_weight_lb": load_lb,
+        "interval_miles": interval_miles,
+        "routes": routes,
+        "weather_query": query,
+        "heatmap_grid": grid,
+        "heatmap_query": heatmap.forecast_query(grid["cells"], effective_departure),
+        "notices": notices,
+    }
+
+
+def score_routes(departure: datetime, load_lb: float, routes: list[dict], series: list) -> dict:
+    """Risk at every checkpoint, route summaries and the recommendation.
+
+    `routes` are the routes returned by plan_routes (geometry not needed);
+    `series` are the parsed forecasts, indexed by each checkpoint's "point".
+    """
+    summaries, out_routes, missing_weather = [], [], False
+    for r in routes:
+        cps_out, levels = [], []
+        for cp in r["checkpoints"]:
+            eta = datetime.fromisoformat(cp["eta"])
+            wx = series[cp["point"]].at(eta.timestamp())
+            missing_weather |= wx["missing"]
+            risk = assess(wx["wind_mph"], wx["rain_in_hr"], wx["snow_in_hr"], load_lb)
+            levels.append((risk.level, cp["covered_miles"]))
+            cps_out.append({
+                "index": cp["index"],
+                "mile": cp["mile"],
+                "lat": cp["lat"],
+                "lon": cp["lon"],
+                "eta": cp["eta"],
                 "wind_mph": wx["wind_mph"],
                 "rain_in_hr": wx["rain_in_hr"],
                 "snow_in_hr": wx["snow_in_hr"],
@@ -117,31 +165,30 @@ def build_plan(origin_q: str, destination_q: str, departure: datetime, load_lb: 
                 "level": risk.level,
                 "level_name": risk.level_name,
                 "load_rule": risk.load_rule,
-                "covered_miles": round(cp.covered_miles, 2),
+                "covered_miles": cp["covered_miles"],
             })
-        r["checkpoints_out"] = cps_out
-        r["summary"] = summarize(r["id"], r["raw"].length_miles, r["raw"].travel_seconds, levels)
-        summaries.append(r["summary"])
+        s = summarize(r["id"], r["distance_miles"], r["duration_seconds"], levels)
+        summaries.append(s)
+        out_routes.append((r, s, cps_out))
 
     ordered, reason = rank(summaries)
     rank_of = {s.route_id: i + 1 for i, s in enumerate(ordered)}
     best = ordered[0]
+    notices = []
     if missing_weather:
         notices.append("Some forecast values were unavailable and were treated as zero.")
     if best.max_level >= SEVERE:
         notices.append(f"Even the recommended route has {LEVEL_NAMES[best.max_level]} conditions "
                        "at one or more checkpoints.")
 
-    out_routes = []
-    for r in routes:
-        s = r["summary"]
-        arrival = effective_departure + timedelta(seconds=r["raw"].travel_seconds)
-        out_routes.append({
+    result = []
+    for r, s, cps_out in out_routes:
+        arrival = departure + timedelta(seconds=r["duration_seconds"])
+        result.append({
             "id": r["id"],
             "rank": rank_of[r["id"]],
             "recommended": r["id"] == best.route_id,
-            "source": r["raw"].source,
-            "geometry": [[round(la, 5), round(lo, 5)] for la, lo in simplify(r["raw"].points)],
+            "source": r["source"],
             "summary": {
                 "distance_miles": round(s.distance_miles, 1),
                 "duration_seconds": round(s.duration_seconds),
@@ -150,20 +197,12 @@ def build_plan(origin_q: str, destination_q: str, departure: datetime, load_lb: 
                 "average_risk": round(s.average_risk, 2),
                 "max_level": s.max_level,
                 "max_level_name": LEVEL_NAMES[s.max_level],
-                "checkpoint_count": len(r["checkpoints_out"]),
+                "checkpoint_count": len(cps_out),
             },
-            "checkpoints": r["checkpoints_out"],
+            "checkpoints": cps_out,
         })
-
-    grid = heatmap.build_grid([r["raw"].points for r in routes])
     return {
-        "origin": vars(origin),
-        "destination": vars(destination),
-        "departure": effective_departure.isoformat(timespec="minutes"),
-        "load_weight_lb": load_lb,
-        "interval_miles": interval_miles,
-        "routes": out_routes,
+        "routes": result,
         "recommendation": {"route_id": best.route_id, "reason": reason},
-        "heatmap_grid": grid,
         "notices": notices,
     }

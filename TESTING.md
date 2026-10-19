@@ -15,7 +15,7 @@ cd backend
 python manage.py test planner -v 2
 ```
 
-**Expected:** `Ran 55 tests ... OK`. **Evidence to keep:** the last 5 lines of the output.
+**Expected:** `Ran 57 tests ... OK`. **Evidence to keep:** the last 5 lines of the output.
 
 | PDF requirement | Test file | What is checked |
 | --- | --- | --- |
@@ -29,10 +29,11 @@ python manage.py test planner -v 2
 | Sample every 10/25/50 mi | `test_geo.py::CheckpointSpacing`, `test_api.py::test_sampling_interval_changes_checkpoint_count` | 0, N, 2N … + destination; mileage coverage sums to route length |
 | ETA at each checkpoint | `test_geo.py::RouteProfileEta`, `test_api.py::test_eta_reflects_travel_time` | uses the routing API's per-point travel time; non-uniform speeds |
 | Weather at ETA | `test_weather.py::ValueAtEta` | nearest hour for wind; hour containing the ETA for rain/snow; mm/cm → inches without boundary rounding errors |
-| 3 route options | `test_api.py::test_returns_three_routes...`, `test_fills_missing_alternatives...` | 3 routes; fallback when the API returns only 1 |
+| 3 route options | `test_api.py::test_routes_step_returns_three_routes...`, `test_fills_missing_alternatives...` | 3 routes; fallback when the API returns only 1 |
 | Recommendation order | `test_recommend.py::Ranking` | each of the 4 rules decides on its own; No Travel never preferred |
 | Heatmap 0–48 h | `test_api.py::HeatmapEndpoint` | 49 hourly levels per cell, load rule applied |
-| Input validation | `test_api.py::test_validation_errors` | empty place, past/too-far departure, bad load, bad interval |
+| Input validation | `test_api.py::test_validation_errors`, `test_plan_rejects_bad_weather_or_route_data`, `test_weather.py::BrowserQuery` | empty place, past/too-far departure, bad load, bad interval; malformed forecasts or route data posted by the browser |
+| Weather fetched by the browser, not the server | `test_api.py` (every test) | the server's HTTP client fails the test if it ever calls Open-Meteo |
 
 ---
 

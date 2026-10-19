@@ -20,7 +20,7 @@ export default function App() {
   const loadForecast = useCallback(async (p, id) => {
     setHeatStatus('loading')
     try {
-      const f = await corridorForecast({ cells: p.heatmap_grid.cells, start: p.departure, loadWeight: p.load_weight_lb })
+      const f = await corridorForecast(p)
       if (requestId.current !== id) return
       setForecast(f)
       setHeatStatus('ready')

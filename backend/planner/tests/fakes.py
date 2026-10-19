@@ -107,3 +107,19 @@ def router(tomtom: FakeTomTom, openmeteo: FakeOpenMeteo):
             return openmeteo(url, params, timeout)
         return tomtom(url, params, timeout)
     return get
+
+
+def browser_fetch(query: dict, openmeteo: FakeOpenMeteo) -> list:
+    """Do what the frontend does: send the server-described request to Open-Meteo in
+    batches and collect each location's raw `hourly` block, in order."""
+    out = []
+    points, size = query["points"], query["batch_size"]
+    for i in range(0, len(points), size):
+        batch = points[i:i + size]
+        params = dict(query["params"],
+                      latitude=",".join(str(p[0]) for p in batch),
+                      longitude=",".join(str(p[1]) for p in batch))
+        data = openmeteo(query["url"], params, None).json()
+        items = data if isinstance(data, list) else [data]
+        out.extend(item["hourly"] for item in items)
+    return out

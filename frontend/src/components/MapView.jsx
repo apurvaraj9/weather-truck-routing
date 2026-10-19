@@ -68,7 +68,9 @@ export default function MapView({ plan, selectedId, onSelect, forecast, hour, sh
   useEffect(() => {
     const m = map.current
     const store = layers.current
-    Object.values(store).flat().forEach((l) => l.remove())
+    // Remove the previous trip's layers (each route entry holds two polylines).
+    store.routes.forEach(({ casing, line }) => { casing.remove(); line.remove() })
+    ;[...store.checkpoints, ...store.cells, ...store.other].forEach((l) => l.remove())
     store.routes = []
     store.checkpoints = []
     store.cells = []

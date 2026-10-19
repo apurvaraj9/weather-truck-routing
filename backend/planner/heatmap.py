@@ -5,7 +5,7 @@ route options. Grid spacing grows with trip length so the number of cells (and s
 number of Open-Meteo lookups) stays bounded.
 """
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from .geo import LatLon, cumulative_mi, haversine_mi, point_at
 from .providers import openmeteo
@@ -59,13 +59,22 @@ def build_grid(routes: list[list[LatLon]]) -> dict:
         spacing *= 1.15
 
 
-def hourly_risk(cells: list[tuple[float, float]], start: datetime, load_lb: float) -> dict:
-    """Forecast for each cell for hours 0..HEATMAP_HOURS after `start` (floored to the hour)."""
-    start_h = start.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    end_h = start_h + timedelta(hours=HEATMAP_HOURS)
-    series = openmeteo.fetch_hourly(cells, start_h, end_h)
+def forecast_query(cells: list[dict], start: datetime) -> dict:
+    """Open-Meteo request (made by the browser) for hours 0..48 after `start`."""
+    start_h = openmeteo.hour_floor(start)
+    query, index = openmeteo.build_query([(c["lat"], c["lon"]) for c in cells],
+                                         start_h, start_h + timedelta(hours=HEATMAP_HOURS))
+    query["start"] = start_h.isoformat()
+    query["cell_point"] = index  # cell i uses query["points"][cell_point[i]]
+    return query
+
+
+def hourly_risk(series: list, cell_point: list[int], start: datetime, load_lb: float) -> dict:
+    """Wind/rain/snow and risk level for each cell for hours 0..HEATMAP_HOURS after `start`."""
+    start_h = openmeteo.hour_floor(start)
     out = []
-    for s in series:
+    for p in cell_point:
+        s = series[p]
         wind, rain, snow, level = [], [], [], []
         for h in range(HEATMAP_HOURS + 1):
             # Value "at" hour h: wind at that hour, precipitation over the hour starting there.

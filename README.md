@@ -34,19 +34,36 @@ checkpoint spacing (10 / 25 / 50 miles). The app:
 ## Architecture
 
 ```
-React (Vite, Leaflet)  ──POST /api/plan/────▶  Django ──▶ TomTom Search (geocode)
-       │                                         │   └──▶ TomTom Routing (truck, 3 routes)
-       └────────────POST /api/heatmap/───────▶  │   └──▶ Open-Meteo hourly forecast
+Browser (React, Leaflet)                         Django (all PDF logic)
+ 1. POST /api/routes/ ─────────────────────────▶ geocode + 3 truck routes (TomTom),
+                      ◀── routes, checkpoints,   checkpoints every N mi, ETA at each,
+                          ETAs, forecast request heatmap grid
+ 2. GET api.open-meteo.com (the exact request
+    described by the server, sent by the browser)
+ 3. POST /api/plan/ (raw forecasts) ───────────▶ weather at each ETA, risk table,
+                      ◀── risk + recommendation  load rules, summaries, recommendation
+ 4. GET api.open-meteo.com (corridor, 0–48 h)
+ 5. POST /api/heatmap/ (raw forecasts) ────────▶ hourly risk per corridor cell
 ```
 
 * **One deployable service.** In production Django (via WhiteNoise) serves the built React
   app at `/` and the JSON API at `/api/`. No database is needed: the app is stateless.
-* **`POST /api/plan/`** returns the 3 routes (simplified geometry), every checkpoint with
-  ETA, weather values, per-factor and overall risk, route summaries, the recommendation and
-  the heatmap grid cells.
-* **`POST /api/heatmap/`** returns hours 0–48 of wind / rain / snow and the risk level for every
-  corridor cell. It is loaded right after the plan, and the whole 49-hour block arrives at
-  once, so the slider recolours the map instantly with no further network calls.
+* **Why the browser fetches the forecasts.** Open-Meteo's free tier is limited *per IP address*.
+  Free hosting platforms send all their customers' traffic from a few shared IP addresses, so
+  Open-Meteo refuses server-side requests there ("rate limit reached") because other apps have
+  used up that address's allowance. The browser therefore sends the forecast request (each visitor
+  has their own allowance), but the *server* defines it (points, hours, variables, units) and does
+  all interpretation: unit conversion, choosing the forecast hour at each ETA, the risk table,
+  load rules and the recommendation. TomTom is called only by the server (its limit is per key,
+  and the key stays secret).
+* **`POST /api/routes/`** returns the 3 routes (simplified geometry), every checkpoint with its
+  ETA, the Open-Meteo request for those checkpoints, the heatmap grid cells and the heatmap's
+  Open-Meteo request.
+* **`POST /api/plan/`** takes the routes and the raw forecasts and returns every checkpoint's
+  weather values, per-factor and overall risk, route summaries and the recommendation.
+* **`POST /api/heatmap/`** takes the corridor's raw forecasts and returns hours 0–48 of wind / rain /
+  snow and the risk level for every cell. The whole 49-hour block arrives at once, so the slider
+  recolours the map instantly with no further network calls.
 * **`GET /api/health/`** – liveness check used by the host.
 
 ### Third-party services
@@ -54,7 +71,7 @@ React (Vite, Leaflet)  ──POST /api/plan/────▶  Django ──▶ To
 | Service | Used for | Key | Free tier (checked Oct 2026) |
 | --- | --- | --- | --- |
 | TomTom Routing + Search APIs | geocoding, truck routes with traffic-aware travel times and per-point travel time (`progress`) | **Required** (`TOMTOM_API_KEY`) | Freemium: 2,500 non-tile requests/day, no credit card, usage above the cap is blocked rather than billed |
-| Open-Meteo forecast API | hourly wind (mph), rain + showers, snowfall | None | Non-commercial: 10,000 calls/day, 5,000/hour, 600/minute; each location in a multi-location request counts as one call |
+| Open-Meteo forecast API (called from the visitor's browser) | hourly wind (mph), rain + showers, snowfall | None | Non-commercial: 10,000 calls/day, 5,000/hour, 600/minute **per visitor IP address**; each location in a multi-location request counts as one call |
 | OpenStreetMap standard tiles | basemap | None | Free for light interactive use under the OSM tile usage policy; attribution shown on the map |
 
 A single trip plan uses 2 geocoding calls + 1 routing call (+ up to 4 extra routing calls when
@@ -95,11 +112,12 @@ cd backend
 python manage.py test planner -v 2
 ```
 
-55 automated tests cover every risk-table boundary, all load rules, checkpoint spacing and
+57 automated tests cover every risk-table boundary, all load rules, checkpoint spacing and
 mileage coverage, ETA interpolation, unit conversion and hour selection of the forecast,
-the recommendation order (each rule in isolation), input validation, and the full
-`/api/plan/` and `/api/heatmap/` flows with TomTom and Open-Meteo replaced by deterministic
-fakes at the HTTP layer. Manual browser checks are described in **[TESTING.md](TESTING.md)**.
+the recommendation order (each rule in isolation), validation of every input (including the
+forecasts posted by the browser), and the full routes → forecast → plan and heatmap flows,
+with TomTom replaced by a deterministic fake and the browser's Open-Meteo step simulated with
+deterministic forecasts. A test also asserts that the server never calls Open-Meteo itself. Manual browser checks are described in **[TESTING.md](TESTING.md)**.
 
 ## Deployment
 
@@ -142,9 +160,12 @@ environment settings; `DJANGO_SECRET_KEY` is generated by Render. Health check: 
 ## Known limitations
 
 * Weather is a forecast, sampled at points; conditions between checkpoints are not observed.
-* Open-Meteo's free tier allows 600 location lookups per minute. Lookups are de-duplicated on a
-  ~3-mile (0.05°) grid and cached for 15 minutes, but a very long trip at 10-mile spacing
-  (e.g. coast to coast) can need several hundred lookups and may hit the per-minute limit if
-  repeated quickly; the app then shows a clear "wait a minute and retry" message.
+* Open-Meteo's free tier allows each visitor's network 600 location lookups per minute. Lookups are
+  de-duplicated on a ~3-mile (0.05°) grid, but a very long trip at 10-mile spacing (e.g. coast to
+  coast) can need several hundred lookups and may hit the per-minute limit if repeated quickly;
+  the app then shows a clear "wait a minute and try again" message.
+* Because the browser posts the forecasts it fetched, a visitor could in principle send altered
+  weather to the API. That only affects that visitor's own result (nothing is stored), so it is
+  acceptable for this stateless app.
 * Free hosting plans that sleep when idle (such as Render's free web services) make the first
   request after a quiet period slow while the service wakes up.

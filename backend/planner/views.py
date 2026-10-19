@@ -1,13 +1,20 @@
 """JSON API.
 
-POST /api/plan/     -> 3 route options with checkpoints, weather at ETA, risk, recommendation
-POST /api/heatmap/  -> 0-48 h forecast risk for the corridor grid returned by /api/plan/
+A trip is planned in two calls, because the browser (not the server) fetches the
+forecasts from Open-Meteo (see providers/openmeteo.py for why):
+
+POST /api/routes/   -> 3 route options, checkpoints with ETAs, and the forecast request
+                       the browser must send to Open-Meteo
+POST /api/plan/     -> weather at each checkpoint's ETA, risk levels, route summaries
+                       and the recommendation, from the forecasts the browser fetched
+POST /api/heatmap/  -> 0-48 h risk for the corridor cells, from browser-fetched forecasts
 GET  /api/health/   -> liveness check
 
 The API is stateless (no cookies, sessions or auth), so CSRF protection is not used.
 """
 import json
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 
 from django.http import JsonResponse
@@ -15,8 +22,8 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
 from . import heatmap
-from .providers import ProviderError
-from .service import build_plan
+from .providers import ProviderError, openmeteo
+from .service import plan_routes, score_routes
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +31,9 @@ INTERVALS = (10, 25, 50)
 MAX_LOAD_LB = 200_000
 MAX_DAYS_AHEAD = 7
 PAST_GRACE = timedelta(minutes=15)
+MAX_ROUTES = 3
+MAX_CHECKPOINTS = 2_000      # per route (a 10-mile spacing covers 20,000 miles)
+MAX_WEATHER_POINTS = 6_000
 
 
 class ValidationError(Exception):
@@ -44,16 +54,20 @@ def _body(request) -> dict:
     return data
 
 
-def parse_departure(value) -> datetime:
+def parse_datetime(value, name: str) -> datetime:
     if not isinstance(value, str) or not value:
-        raise ValidationError("Departure date/time is required.")
+        raise ValidationError(f"{name} is required.")
     try:
         dt = datetime.fromisoformat(value)
     except ValueError:
-        raise ValidationError("Departure must be an ISO 8601 date/time.")
+        raise ValidationError(f"{name} must be an ISO 8601 date/time.")
     if dt.tzinfo is None:
-        raise ValidationError("Departure must include a time zone (e.g. 2026-10-20T08:00:00Z).")
-    dt = dt.astimezone(timezone.utc)
+        raise ValidationError(f"{name} must include a time zone (e.g. 2026-10-20T08:00:00Z).")
+    return dt.astimezone(timezone.utc)
+
+
+def parse_departure(value) -> datetime:
+    dt = parse_datetime(value, "Departure date/time")
     now = datetime.now(timezone.utc)
     if dt < now - PAST_GRACE:
         raise ValidationError("Departure time is in the past.")
@@ -63,6 +77,8 @@ def parse_departure(value) -> datetime:
 
 
 def parse_load(value) -> float:
+    if isinstance(value, bool):
+        raise ValidationError("Load weight must be a number of pounds.")
     try:
         load = float(value)
     except (TypeError, ValueError):
@@ -80,6 +96,59 @@ def parse_place(value, name: str) -> str:
     return value.strip()
 
 
+def _num(value, name: str, lo: float = -math.inf, hi: float = math.inf) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+            or not lo <= value <= hi:
+        raise ValidationError(f"Invalid route data: {name}.")
+    return value
+
+
+def parse_scoring_routes(value, weather_count: int) -> list[dict]:
+    """Validate the routes returned by /api/routes/ and posted back for scoring."""
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_ROUTES:
+        raise ValidationError("Invalid route data: routes.")
+    routes = []
+    for r in value:
+        if not isinstance(r, dict) or not isinstance(r.get("id"), str) or len(r["id"]) > 20:
+            raise ValidationError("Invalid route data: id.")
+        cps = r.get("checkpoints")
+        if not isinstance(cps, list) or not 1 <= len(cps) <= MAX_CHECKPOINTS:
+            raise ValidationError("Invalid route data: checkpoints.")
+        clean = []
+        for cp in cps:
+            if not isinstance(cp, dict):
+                raise ValidationError("Invalid route data: checkpoint.")
+            point = cp.get("point")
+            if isinstance(point, bool) or not isinstance(point, int) or not 0 <= point < weather_count:
+                raise ValidationError("Invalid route data: checkpoint weather index.")
+            clean.append({
+                "index": int(_num(cp.get("index"), "index", 0)),
+                "mile": _num(cp.get("mile"), "mile", 0),
+                "lat": _num(cp.get("lat"), "lat", -90, 90),
+                "lon": _num(cp.get("lon"), "lon", -180, 180),
+                "eta": parse_datetime(cp.get("eta"), "Checkpoint ETA").isoformat(timespec="minutes"),
+                "covered_miles": _num(cp.get("covered_miles"), "covered_miles", 0),
+                "point": point,
+            })
+        routes.append({
+            "id": r["id"],
+            "source": str(r.get("source", ""))[:20],
+            "distance_miles": _num(r.get("distance_miles"), "distance_miles", 0),
+            "duration_seconds": _num(r.get("duration_seconds"), "duration_seconds", 0),
+            "checkpoints": clean,
+        })
+    return routes
+
+
+def parse_weather(value) -> list:
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_WEATHER_POINTS:
+        raise ValidationError("Weather data must be a list with one entry per forecast location.")
+    try:
+        return openmeteo.parse_many(value, len(value))
+    except ProviderError as exc:
+        raise ValidationError(str(exc))
+
+
 @require_GET
 def health(_request):
     return JsonResponse({"status": "ok"})
@@ -87,7 +156,7 @@ def health(_request):
 
 @csrf_exempt
 @require_POST
-def plan(request):
+def routes(request):
     try:
         data = _body(request)
         origin = parse_place(data.get("origin"), "Origin")
@@ -104,10 +173,24 @@ def plan(request):
         return _error(str(exc), 400)
 
     try:
-        return JsonResponse(build_plan(origin, destination, departure, load, interval))
+        return JsonResponse(plan_routes(origin, destination, departure, load, interval))
     except ProviderError as exc:
-        log.warning("plan failed: %s", exc)
+        log.warning("routes failed: %s", exc)
         return _error(str(exc), exc.status)
+
+
+@csrf_exempt
+@require_POST
+def plan(request):
+    try:
+        data = _body(request)
+        departure = parse_datetime(data.get("departure"), "Departure date/time")
+        load = parse_load(data.get("load_weight_lb"))
+        series = parse_weather(data.get("weather"))
+        route_list = parse_scoring_routes(data.get("routes"), len(series))
+    except ValidationError as exc:
+        return _error(str(exc), 400)
+    return JsonResponse(score_routes(departure, load, route_list, series))
 
 
 @csrf_exempt
@@ -115,23 +198,13 @@ def plan(request):
 def heatmap_view(request):
     try:
         data = _body(request)
-        start = parse_departure(data.get("start"))
+        start = parse_datetime(data.get("start"), "start")
         load = parse_load(data.get("load_weight_lb"))
-        cells = data.get("cells")
-        if not isinstance(cells, list) or not cells or len(cells) > 400:
-            raise ValidationError("cells must be a non-empty list of up to 400 [lat, lon] pairs.")
-        coords = []
-        for c in cells:
-            if (not isinstance(c, (list, tuple)) or len(c) != 2
-                    or not all(isinstance(v, (int, float)) for v in c)
-                    or not (-90 <= c[0] <= 90 and -180 <= c[1] <= 180)):
-                raise ValidationError("Each cell must be a [lat, lon] pair.")
-            coords.append((float(c[0]), float(c[1])))
+        series = parse_weather(data.get("weather"))
+        cell_point = data.get("cell_point")
+        if not isinstance(cell_point, list) or not 1 <= len(cell_point) <= 400 or any(
+                isinstance(p, bool) or not isinstance(p, int) or not 0 <= p < len(series) for p in cell_point):
+            raise ValidationError("cell_point must list, for each cell, the index of its weather entry.")
     except ValidationError as exc:
         return _error(str(exc), 400)
-
-    try:
-        return JsonResponse(heatmap.hourly_risk(coords, max(start, datetime.now(timezone.utc)), load))
-    except ProviderError as exc:
-        log.warning("heatmap failed: %s", exc)
-        return _error(str(exc), exc.status)
+    return JsonResponse(heatmap.hourly_risk(series, cell_point, start, load))

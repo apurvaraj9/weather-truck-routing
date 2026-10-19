@@ -62,13 +62,8 @@ FRONTEND_DIST = Path(os.environ.get("FRONTEND_DIST", PROJECT_ROOT / "frontend" /
 WHITENOISE_ROOT = FRONTEND_DIST if FRONTEND_DIST.exists() else None
 WHITENOISE_INDEX_FILE = True
 
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-        "LOCATION": "weather-routing",
-        "TIMEOUT": 15 * 60,
-    }
-}
+# /api/plan/ receives the browser-fetched forecasts (up to a few MB for very long trips).
+DATA_UPLOAD_MAX_MEMORY_SIZE = 12 * 1024 * 1024
 
 # Third-party services
 TOMTOM_API_KEY = os.environ.get("TOMTOM_API_KEY", "")
@@ -82,4 +77,8 @@ LOGGING = {
 }
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+# Django's default ("same-origin") strips the Referer from cross-site requests, and the
+# OpenStreetMap tile servers block map tiles requested without one. This value is the
+# browsers' own default: other sites receive only this site's origin, never the full URL.
+SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

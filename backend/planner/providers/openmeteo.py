@@ -2,34 +2,36 @@
 
 Docs: https://open-meteo.com/en/docs
 
+Why the BROWSER makes the Open-Meteo requests
+---------------------------------------------
+Open-Meteo's free tier is limited per IP address (600 calls/minute, 5,000/hour,
+10,000/day). Free hosting platforms send all their apps' traffic from a few shared
+IP addresses, so server-side calls are refused there because other apps have used up
+the allowance. The server therefore only *describes* the request (``build_query``):
+which points, which hours, which variables. The visitor's browser sends that exact
+request to Open-Meteo, and posts the raw ``hourly`` blocks back. All interpretation
+(unit conversion, picking the hour at each ETA, risk rules) stays here on the server.
+
 Variables used (hourly):
 * wind_speed_10m  - requested in mph (instantaneous value at the hour)
 * rain + showers  - liquid precipitation in mm over the PRECEDING hour (converted to in/hr)
 * snowfall        - snowfall in cm over the PRECEDING hour (converted to in/hr)
 
-Many locations are requested in one call (comma-separated lists). Open-Meteo counts
-each location as one call against its free limits (600/min, 5,000/hour, 10,000/day),
-so locations are de-duplicated on a 0.05 degree grid and results are cached briefly.
+Locations are de-duplicated on a 0.05 degree grid (about 3.5 miles) to save calls.
 """
-import logging
 import math
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-import requests
-from django.conf import settings
-from django.core.cache import cache
-
 from . import ProviderError
 
-log = logging.getLogger(__name__)
-
 URL = "https://api.open-meteo.com/v1/forecast"
-BATCH_SIZE = 100
+HOURLY_VARIABLES = "wind_speed_10m,rain,showers,snowfall"
+BATCH_SIZE = 100          # locations per browser request
 SNAP_DEG = 0.05
 MM_PER_INCH = 25.4
 CM_PER_INCH = 2.54
+MAX_HOURS = 24 * 10       # sanity limit for posted data
 
 
 @dataclass
@@ -71,23 +73,64 @@ def snap(lat: float, lon: float) -> tuple[float, float]:
     return (round(round(lat / SNAP_DEG) * SNAP_DEG, 4), round(round(lon / SNAP_DEG) * SNAP_DEG, 4))
 
 
-def _hour_floor(dt: datetime) -> datetime:
+def hour_floor(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
 
 
-def _parse_location(item: dict) -> HourlySeries:
-    hourly = item.get("hourly") or {}
-    times = hourly.get("time") or []
-    if not times:
-        raise ProviderError("Open-Meteo returned no hourly data.")
+def build_query(points: list[tuple[float, float]], start: datetime, end: datetime) -> tuple[dict, list[int]]:
+    """Describe the Open-Meteo request covering [start, end] for `points`.
+
+    Returns (query, index) where query = {url, params, points, batch_size} for the
+    browser, and index[i] is the position in query["points"] that serves points[i].
+    """
+    start_h = hour_floor(start)
+    end_h = hour_floor(end) + timedelta(hours=1)
+    unique: dict[tuple[float, float], int] = {}
+    index = []
+    for p in points:
+        index.append(unique.setdefault(snap(*p), len(unique)))
+    query = {
+        "url": URL,
+        "params": {
+            "hourly": HOURLY_VARIABLES,
+            "wind_speed_unit": "mph",
+            "timezone": "GMT",
+            "timeformat": "unixtime",
+            "start_hour": start_h.strftime("%Y-%m-%dT%H:%M"),
+            "end_hour": end_h.strftime("%Y-%m-%dT%H:%M"),
+        },
+        "points": [list(p) for p in unique],
+        "batch_size": BATCH_SIZE,
+    }
+    return query, index
+
+
+def _number_list(value, name: str) -> list:
+    if not isinstance(value, list) or len(value) > MAX_HOURS:
+        raise ProviderError(f"Weather data field '{name}' is missing or too long.", status=400)
+    for v in value:
+        if v is not None and (not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v)):
+            raise ProviderError(f"Weather data field '{name}' contains a non-numeric value.", status=400)
+    return value
+
+
+def parse_hourly(hourly) -> HourlySeries:
+    """Parse one location's raw Open-Meteo ``hourly`` block (as posted by the browser)."""
+    if not isinstance(hourly, dict):
+        raise ProviderError("Weather data is not in Open-Meteo's format.", status=400)
+    times = _number_list(hourly.get("time"), "time")
+    if not times or any(t is None for t in times):
+        raise ProviderError("Weather data has no hourly timestamps.", status=400)
 
     def series(name):
-        return hourly.get(name) or [None] * len(times)
+        values = _number_list(hourly.get(name, [None] * len(times)), name)
+        if len(values) != len(times):
+            raise ProviderError(f"Weather data field '{name}' has the wrong length.", status=400)
+        return values
 
     rain, showers, snow_cm = series("rain"), series("showers"), series("snowfall")
-    rain_in = []
-    for r, s in zip(rain, showers):
-        rain_in.append(None if r is None and s is None else ((r or 0.0) + (s or 0.0)) / MM_PER_INCH)
+    rain_in = [None if r is None and s is None else ((r or 0.0) + (s or 0.0)) / MM_PER_INCH
+               for r, s in zip(rain, showers)]
     return HourlySeries(
         start=int(times[0]),
         wind_mph=list(series("wind_speed_10m")),
@@ -96,58 +139,7 @@ def _parse_location(item: dict) -> HourlySeries:
     )
 
 
-def _fetch_batch(coords: list[tuple[float, float]], start: datetime, end: datetime) -> list[HourlySeries]:
-    params = {
-        "latitude": ",".join(f"{c[0]:.4f}" for c in coords),
-        "longitude": ",".join(f"{c[1]:.4f}" for c in coords),
-        "hourly": "wind_speed_10m,rain,showers,snowfall",
-        "wind_speed_unit": "mph",
-        "timezone": "GMT",
-        "timeformat": "unixtime",
-        "start_hour": start.strftime("%Y-%m-%dT%H:%M"),
-        "end_hour": end.strftime("%Y-%m-%dT%H:%M"),
-    }
-    try:
-        resp = requests.get(URL, params=params, timeout=settings.HTTP_TIMEOUT_SECONDS)
-    except requests.RequestException as exc:
-        raise ProviderError(f"Could not reach Open-Meteo: {exc.__class__.__name__}") from exc
-    if resp.status_code == 429:
-        raise ProviderError("Open-Meteo free-tier rate limit reached. Please wait a minute and retry.", status=503)
-    if resp.status_code != 200:
-        reason = ""
-        try:
-            reason = resp.json().get("reason", "")
-        except ValueError:
-            pass
-        raise ProviderError(f"Open-Meteo returned HTTP {resp.status_code}. {reason}".strip())
-    data = resp.json()
-    items = data if isinstance(data, list) else [data]
-    if len(items) != len(coords):
-        raise ProviderError("Open-Meteo returned an unexpected number of locations.")
-    return [_parse_location(it) for it in items]
-
-
-def fetch_hourly(points: list[tuple[float, float]], start: datetime, end: datetime) -> list[HourlySeries]:
-    """Hourly series for each point covering [start, end] (UTC, inclusive, hour resolution)."""
-    start_h = _hour_floor(start)
-    end_h = _hour_floor(end) + timedelta(hours=1)
-    snapped = [snap(*p) for p in points]
-
-    unique, results = [], {}
-    for c in dict.fromkeys(snapped):
-        key = f"om:{c[0]}:{c[1]}:{int(start_h.timestamp())}:{int(end_h.timestamp())}"
-        hit = cache.get(key)
-        if hit is not None:
-            results[c] = hit
-        else:
-            unique.append(c)
-
-    batches = [unique[i:i + BATCH_SIZE] for i in range(0, len(unique), BATCH_SIZE)]
-    if batches:
-        with ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
-            for batch, series_list in zip(batches, pool.map(lambda b: _fetch_batch(b, start_h, end_h), batches)):
-                for c, s in zip(batch, series_list):
-                    results[c] = s
-                    cache.set(f"om:{c[0]}:{c[1]}:{int(start_h.timestamp())}:{int(end_h.timestamp())}", s)
-    log.info("Open-Meteo: %d points, %d unique, %d fetched", len(points), len(results), len(unique))
-    return [results[c] for c in snapped]
+def parse_many(weather, expected: int) -> list[HourlySeries]:
+    if not isinstance(weather, list) or len(weather) != expected:
+        raise ProviderError(f"Expected weather for {expected} locations.", status=400)
+    return [parse_hourly(h) for h in weather]
