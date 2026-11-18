@@ -8,7 +8,8 @@ POST /api/routes/   -> 3 route options, checkpoints with ETAs, and the forecast 
 POST /api/plan/     -> weather at each checkpoint's ETA, risk levels, route summaries
                        and the recommendation, from the forecasts the browser fetched
 POST /api/heatmap/  -> 0-48 h risk for the corridor cells, from browser-fetched forecasts
-GET  /api/health/   -> liveness check
+GET  /api/places/?q=den -> US place suggestions while the user types origin/destination
+GET  /api/health/   -> liveness check (also used by the keep-alive ping)
 
 The API is stateless (no cookies, sessions or auth), so CSRF protection is not used.
 """
@@ -17,12 +18,13 @@ import logging
 import math
 from datetime import datetime, timedelta, timezone
 
+from django.core.cache import cache
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
 from . import heatmap
-from .providers import ProviderError, openmeteo
+from .providers import ProviderError, openmeteo, tomtom
 from .service import plan_routes, score_routes
 
 log = logging.getLogger(__name__)
@@ -34,6 +36,9 @@ PAST_GRACE = timedelta(minutes=15)
 MAX_ROUTES = 3
 MAX_CHECKPOINTS = 2_000      # per route (a 10-mile spacing covers 20,000 miles)
 MAX_WEATHER_POINTS = 6_000
+SUGGEST_MIN_CHARS = 3
+SUGGEST_MAX_CHARS = 100
+SUGGEST_CACHE_SECONDS = 24 * 3600
 
 
 class ValidationError(Exception):
@@ -152,6 +157,24 @@ def parse_weather(value) -> list:
 @require_GET
 def health(_request):
     return JsonResponse({"status": "ok"})
+
+
+@require_GET
+def places(request):
+    """US place suggestions for partially typed text. Cached for a day to save TomTom requests."""
+    q = " ".join(request.GET.get("q", "").split())
+    if not SUGGEST_MIN_CHARS <= len(q) <= SUGGEST_MAX_CHARS:
+        return _error(f"Type between {SUGGEST_MIN_CHARS} and {SUGGEST_MAX_CHARS} characters.", 400)
+    key = "places:" + q.lower()
+    results = cache.get(key)
+    if results is None:
+        try:
+            results = tomtom.suggest(q)
+        except ProviderError as exc:
+            log.warning("place suggestions failed: %s", exc)
+            return _error(str(exc), exc.status)
+        cache.set(key, results, SUGGEST_CACHE_SECONDS)
+    return JsonResponse({"results": results})
 
 
 @csrf_exempt

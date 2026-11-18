@@ -177,13 +177,55 @@ class RoutesAndPlan(Flow):
     def test_unknown_place(self):
         res = self.get_routes(destination="Nowhere")
         self.assertEqual(res.status_code, 422)
-        self.assertIn("Could not find", res.json()["error"])
+        self.assertIn("Could not find a location in the United States", res.json()["error"])
+
+    def test_geocoding_is_limited_to_the_us(self):
+        self.get_routes()
+        self.assertTrue(self.tomtom.geocode_calls)
+        self.assertTrue(all(c["countrySet"] == "US" for c in self.tomtom.geocode_calls))
 
     @override_settings(TOMTOM_API_KEY="")
     def test_missing_api_key(self):
         res = self.get_routes()
         self.assertEqual(res.status_code, 500)
         self.assertIn("TOMTOM_API_KEY", res.json()["error"])
+
+
+@override_settings(TOMTOM_API_KEY="test-key")
+class PlaceSuggestions(Flow):
+    def setUp(self):
+        super().setUp()
+        from django.core.cache import cache
+        cache.clear()
+
+    def suggest(self, q):
+        with mock.patch("requests.get", side_effect=server_get(self.tomtom)):
+            return self.client.get("/api/places/", {"q": q})
+
+    def test_returns_us_only_deduplicated_suggestions(self):
+        res = self.suggest("denv")
+        self.assertEqual(res.status_code, 200, res.content)
+        labels = [r["label"] for r in res.json()["results"]]
+        self.assertEqual(labels, ["Denver, CO", "Denv Street, Denver, CO 80202"])
+        first = res.json()["results"][0]
+        self.assertEqual((first["kind"], first["lat"], first["lon"]), ("Municipality", 39.73915, -104.9847))
+        call = self.tomtom.suggest_calls[0]
+        self.assertEqual((call["typeahead"], call["countrySet"]), ("true", "US"))
+        self.assertNotIn("POI", call["idxSet"])
+
+    def test_results_are_cached_to_save_tomtom_requests(self):
+        self.suggest("Denv")
+        self.suggest("  denv ")
+        self.assertEqual(len(self.tomtom.suggest_calls), 1)
+
+    def test_rejects_too_short_or_too_long_text(self):
+        for q in ["", "de", "x" * 101]:
+            with self.subTest(q=q):
+                self.assertEqual(self.suggest(q).status_code, 400)
+        self.assertEqual(self.tomtom.suggest_calls, [])
+
+    def test_only_get_is_allowed(self):
+        self.assertEqual(self.client.post("/api/places/", {"q": "denver"}).status_code, 405)
 
 
 @override_settings(TOMTOM_API_KEY="test-key")

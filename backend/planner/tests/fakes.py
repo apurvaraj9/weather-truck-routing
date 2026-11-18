@@ -51,9 +51,25 @@ class FakeTomTom:
     def __init__(self, routes_returned=3):
         self.routes_returned = routes_returned
         self.route_calls = []
+        self.geocode_calls = []
+        self.suggest_calls = []
 
     def __call__(self, url, params, timeout):
+        if "/search/2/search/" in url:  # as-you-type suggestions (fuzzy search)
+            self.suggest_calls.append(params)
+            q = unquote(url.split("/search/2/search/")[1].rsplit(".json", 1)[0])
+            return FakeResponse(200, {"results": [
+                {"type": "Geography", "entityType": "Municipality", "position": {"lat": 39.73915, "lon": -104.98470},
+                 "address": {"freeformAddress": "Denver, CO", "countryCode": "US"}},
+                {"type": "Geography", "entityType": "Municipality", "position": {"lat": 39.7392, "lon": -104.9903},
+                 "address": {"freeformAddress": "Denver, CO", "countryCode": "US"}},           # duplicate label
+                {"type": "Street", "position": {"lat": 39.7, "lon": -104.9},
+                 "address": {"freeformAddress": f"{q.title()} Street, Denver, CO 80202", "countryCode": "US"}},
+                {"type": "Geography", "entityType": "Municipality", "position": {"lat": 49.0, "lon": -123.0},
+                 "address": {"freeformAddress": "Denman Island, BC", "countryCode": "CA"}},    # not US
+            ]})
         if "/search/2/geocode/" in url:
+            self.geocode_calls.append(params)
             q = unquote(url.split("/geocode/")[1].rsplit(".json", 1)[0])
             if q == "Nowhere":
                 return FakeResponse(200, {"results": []})

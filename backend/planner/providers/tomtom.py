@@ -1,7 +1,11 @@
-"""TomTom Search (geocoding) and Routing APIs.
+"""TomTom Search (geocoding, place suggestions) and Routing APIs.
 
 Docs: https://docs.tomtom.com/routing-api/documentation/tomtom-maps/v1/calculate-route
       https://docs.tomtom.com/search-api/documentation/geocoding-service/geocode
+      https://docs.tomtom.com/search-api/documentation/search-service/fuzzy-search
+
+Place lookups are limited to the United States (countrySet=US): the app works in
+US units and the project targets US trucking.
 """
 import logging
 import re
@@ -18,6 +22,10 @@ from ..geo import METERS_PER_MILE, LatLon
 log = logging.getLogger(__name__)
 
 BASE = "https://api.tomtom.com"
+COUNTRY = "US"
+SUGGEST_LIMIT = 6
+# Geographies (cities, states, ZIP codes), street addresses and streets; no businesses/POIs.
+SUGGEST_INDEXES = "Geo,PAD,Addr,Str"
 LATLON_RE = re.compile(r"^\s*(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*$")
 
 
@@ -45,7 +53,7 @@ def _key() -> str:
     return settings.TOMTOM_API_KEY
 
 
-def _get(url: str, params: dict) -> dict:
+def _get(url: str, params: dict, what: str = "compute this route") -> dict:
     try:
         resp = requests.get(url, params=params, timeout=settings.HTTP_TIMEOUT_SECONDS)
     except requests.RequestException as exc:
@@ -60,7 +68,7 @@ def _get(url: str, params: dict) -> dict:
             detail = resp.json().get("detailedError", {}).get("message", "")
         except ValueError:
             pass
-        raise ProviderError(f"TomTom could not compute this route. {detail}".strip(), status=422)
+        raise ProviderError(f"TomTom could not {what}. {detail}".strip(), status=422)
     if resp.status_code != 200:
         raise ProviderError(f"TomTom returned HTTP {resp.status_code}.")
     try:
@@ -70,20 +78,49 @@ def _get(url: str, params: dict) -> dict:
 
 
 def geocode(query: str) -> Place:
-    """Resolve free text (or a "lat,lon" pair) to a single place."""
+    """Resolve free text (or a "lat,lon" pair) to a single place in the United States."""
     m = LATLON_RE.match(query)
     if m:
         lat, lon = float(m.group(1)), float(m.group(2))
         if -90 <= lat <= 90 and -180 <= lon <= 180:
             return Place(query, f"{lat:.5f}, {lon:.5f}", lat, lon)
-    data = _get(f"{BASE}/search/2/geocode/{quote(query, safe='')}.json", {"key": _key(), "limit": 1})
+    data = _get(f"{BASE}/search/2/geocode/{quote(query, safe='')}.json",
+                {"key": _key(), "limit": 1, "countrySet": COUNTRY}, what="find this location")
     results = data.get("results") or []
     if not results:
-        raise ProviderError(f'Could not find a location for "{query}".', status=422)
+        raise ProviderError(f'Could not find a location in the United States for "{query}".', status=422)
     r = results[0]
     pos = r["position"]
     label = r.get("address", {}).get("freeformAddress") or query
     return Place(query, label, float(pos["lat"]), float(pos["lon"]))
+
+
+def suggest(query: str) -> list[dict]:
+    """Up to SUGGEST_LIMIT US places matching partially typed text (for the as-you-type list)."""
+    data = _get(f"{BASE}/search/2/search/{quote(query, safe='')}.json", {
+        "key": _key(),
+        "typeahead": "true",
+        "limit": SUGGEST_LIMIT,
+        "countrySet": COUNTRY,
+        "idxSet": SUGGEST_INDEXES,
+    }, what="search for places")
+    out, seen = [], set()
+    for r in data.get("results") or []:
+        address = r.get("address") or {}
+        label = address.get("freeformAddress")
+        pos = r.get("position") or {}
+        if not label or address.get("countryCode", COUNTRY) != COUNTRY or "lat" not in pos or "lon" not in pos:
+            continue
+        if label in seen:
+            continue
+        seen.add(label)
+        out.append({
+            "label": label,
+            "kind": r.get("entityType") or r.get("type") or "",
+            "lat": round(float(pos["lat"]), 5),
+            "lon": round(float(pos["lon"]), 5),
+        })
+    return out
 
 
 def _parse_route(route: dict, source: str) -> RawRoute:

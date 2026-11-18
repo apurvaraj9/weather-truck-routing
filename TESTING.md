@@ -15,7 +15,7 @@ cd backend
 python manage.py test planner -v 2
 ```
 
-**Expected:** `Ran 57 tests ... OK`. **Evidence to keep:** the last 5 lines of the output.
+**Expected:** `Ran 62 tests ... OK`. **Evidence to keep:** the last 5 lines of the output.
 
 | PDF requirement | Test file | What is checked |
 | --- | --- | --- |
@@ -34,6 +34,7 @@ python manage.py test planner -v 2
 | Heatmap 0–48 h | `test_api.py::HeatmapEndpoint` | 49 hourly levels per cell, load rule applied |
 | Input validation | `test_api.py::test_validation_errors`, `test_plan_rejects_bad_weather_or_route_data`, `test_weather.py::BrowserQuery` | empty place, past/too-far departure, bad load, bad interval; malformed forecasts or route data posted by the browser |
 | Weather fetched by the browser, not the server | `test_api.py` (every test) | the server's HTTP client fails the test if it ever calls Open-Meteo |
+| US place suggestions and US-only geocoding (added after submission) | `test_api.py::PlaceSuggestions`, `test_geocoding_is_limited_to_the_us` | US-only filter, duplicates removed, no businesses, results cached, 3–100 character limit, GET only |
 
 ---
 
@@ -58,7 +59,10 @@ Use the same trip for B1–B8 unless told otherwise:
 | B11 | 0–48 h forecast slider | Drag the slider from 0 to 48 | Label shows +0 h … +48 h with the date/time; cell colours change immediately with no loading | Smooth, no lag or flicker | Short screen recording or two screenshots (0 h and 48 h) |
 | B12 | Error handling | Destination `qwertyuiopasdf`; then departure in the past; then load `-1` | Clear red message, no crash | Message explains the problem | Screenshot |
 | B13 | Short trip still gives 3 routes | Origin `Dallas, TX`, Destination `Fort Worth, TX` | Three routes; possibly a yellow note saying extra routes were generated | 3 cards | Screenshot |
-| B14 | Phone layout | Open the app on a phone (or browser dev-tools phone view) | Map on top, form and cards below, slider usable | Nothing cut off | Screenshot |
+| B14 | Phone layout | Open the app on a phone (or browser dev-tools phone view) | Map on top, form and cards below, slider usable, footer at the bottom | Nothing cut off | Screenshot |
+| B15 | US place suggestions (added after submission) | Clear Origin and type `denv` | After a short pause a list appears with "Denver, CO" marked CITY; arrow keys + Enter or a click fill the box; Escape closes it | Only US places; nothing appears for fewer than 3 characters | Screenshot of the list |
+| B16 | US-only lookup (added after submission) | Destination `Toronto, ON`, then Find safest route | Either a US place with a similar name is used, or a red message "Could not find a location in the United States…" — never a Canadian route | Message or US place shown | Screenshot |
+| B17 | Footer (added after submission) | Look at the bottom of the page; click each link | "Developed by Apurva Raj · GitHub · Source code"; links open the portfolio, GitHub profile and repository in a new tab | All three open correctly | Screenshot |
 
 ## Part C — Hosted application
 
@@ -86,4 +90,7 @@ login or local state is needed). Also open `https://<your-app>/api/health/` — 
 | B12 | | |
 | B13 | | |
 | B14 | | |
+| B15 | | |
+| B16 | | |
+| B17 | | |
 | Part C | | |

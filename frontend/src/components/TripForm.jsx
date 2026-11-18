@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import PlaceInput from './PlaceInput.jsx'
 
 const pad = (n) => String(n).padStart(2, '0')
 const toLocalInput = (d) =>
@@ -35,16 +36,8 @@ export default function TripForm({ onSubmit, loading }) {
 
   return (
     <form className="trip-form" onSubmit={submit}>
-      <label className="field">
-        <span>Origin</span>
-        <input value={origin} onChange={(e) => setOrigin(e.target.value)} required maxLength={200}
-          placeholder="City, address or lat,lon" autoComplete="off" />
-      </label>
-      <label className="field">
-        <span>Destination</span>
-        <input value={destination} onChange={(e) => setDestination(e.target.value)} required maxLength={200}
-          placeholder="City, address or lat,lon" autoComplete="off" />
-      </label>
+      <PlaceInput label="Origin" value={origin} onChange={setOrigin} placeholder="US city or address" />
+      <PlaceInput label="Destination" value={destination} onChange={setDestination} placeholder="US city or address" />
       <div className="field-row">
         <label className="field">
           <span>Departure</span>

@@ -98,3 +98,16 @@ export async function corridorForecast(plan) {
     weather,
   })
 }
+
+// US place suggestions for the origin/destination boxes. Returns [] on any error so
+// typing never shows an error; the trip request still validates the final text.
+export async function suggestPlaces(query, signal) {
+  try {
+    const res = await fetch(`/api/places/?q=${encodeURIComponent(query)}`, { signal })
+    if (!res.ok) return []
+    const data = await res.json()
+    return Array.isArray(data.results) ? data.results : []
+  } catch {
+    return []
+  }
+}

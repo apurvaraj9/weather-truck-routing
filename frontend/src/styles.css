@@ -26,8 +26,8 @@ button, input { font: inherit; color: inherit; }
   height: 100%;
   display: grid;
   grid-template-columns: 410px 1fr;
-  grid-template-rows: auto 1fr;
-  grid-template-areas: 'top top' 'side map';
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-areas: 'top top' 'side map' 'foot foot';
 }
 
 /* ---------- top bar ---------- */
@@ -58,7 +58,7 @@ button, input { font: inherit; color: inherit; }
 }
 .trip-form { display: grid; gap: 12px; }
 .field { display: grid; gap: 5px; border: 0; margin: 0; padding: 0; min-width: 0; }
-.field > span, .field > legend {
+.field > span, .field > legend, .place-field > label {
   font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; padding: 0;
 }
 .field input {
@@ -171,11 +171,38 @@ button, input { font: inherit; color: inherit; }
   .app {
     height: auto; min-height: 100%;
     grid-template-columns: 1fr;
-    grid-template-rows: auto 62vh auto;
-    grid-template-areas: 'top' 'map' 'side';
+    grid-template-rows: auto 62vh auto auto;
+    grid-template-areas: 'top' 'map' 'side' 'foot';
   }
   .topbar { flex-direction: column; gap: 2px; padding: 10px 16px; }
   .sidebar { border-right: 0; padding: 16px; }
   .heat-control { left: 8px; bottom: 8px; width: calc(100% - 16px); padding: 8px 10px; }
   .stats { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* ---------- place suggestions ---------- */
+.place-field { position: relative; }
+.suggestions {
+  position: absolute; z-index: 2000; top: 100%; left: 0; right: 0; margin: 4px 0 0; padding: 4px 0;
+  list-style: none; background: #fff; border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(15, 31, 42, 0.14); max-height: 280px; overflow-y: auto;
+}
+.suggestions li {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+  padding: 8px 12px; cursor: pointer; font-size: 14px;
+}
+.suggestions li.active { background: #eaf4f8; }
+.suggestion-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.suggestion-kind { flex: none; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.suggestions .suggestion-empty { color: var(--muted); cursor: default; }
+
+/* ---------- footer ---------- */
+.site-footer {
+  grid-area: foot;
+  display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 6px 10px;
+  padding: 8px 16px; font-size: 13px; color: var(--muted);
+  background: var(--panel); border-top: 1px solid var(--line);
+}
+.site-footer a { color: var(--brand-2); font-weight: 600; text-decoration: none; }
+.site-footer a:hover, .site-footer a:focus-visible { text-decoration: underline; }
+.footer-sep { color: var(--line); }

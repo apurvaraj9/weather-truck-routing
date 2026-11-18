@@ -5,6 +5,13 @@ import RouteCards from './components/RouteCards.jsx'
 import MapView from './components/MapView.jsx'
 import HeatmapControl from './components/HeatmapControl.jsx'
 
+const AUTHOR = {
+  name: 'Apurva Raj',
+  portfolio: 'https://apurvaraj.pages.dev/',
+  github: 'https://github.com/apurvaraj9',
+  source: 'https://github.com/apurvaraj9/weather-truck-routing',
+}
+
 export default function App() {
   const [plan, setPlan] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -79,6 +86,16 @@ export default function App() {
             setHour={setHour} show={showHeatmap} setShow={setShowHeatmap} />
         )}
       </main>
+      <footer className="site-footer">
+        <span>
+          Developed by{' '}
+          <a href={AUTHOR.portfolio} target="_blank" rel="noopener noreferrer">{AUTHOR.name}</a>
+        </span>
+        <span className="footer-sep" aria-hidden="true">·</span>
+        <a href={AUTHOR.github} target="_blank" rel="noopener noreferrer">GitHub</a>
+        <span className="footer-sep" aria-hidden="true">·</span>
+        <a href={AUTHOR.source} target="_blank" rel="noopener noreferrer">Source code</a>
+      </footer>
     </div>
   )
 }
